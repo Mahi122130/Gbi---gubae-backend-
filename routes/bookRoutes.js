@@ -1,107 +1,80 @@
 const express = require('express');
 const router = express.Router();
-const { protect, librarianOnly } = require('../middleware/authMiddleware');
+const { protect } = require('../middleware/authMiddleware');
 const Book = require('../models/Book');
-const Notification = require('../models/Notification');
 const Borrow = require('../models/Borrow');
+const upload = require('../middleware/uploadMiddleware');
 
-// 1. SEARCH BOOKS (Public)
+// 1. ADD NEW BOOK (Librarian Only)
+router.post('/add', protect, upload.fields([
+    { name: 'cover', maxCount: 1 },
+    { name: 'pdf', maxCount: 1 }
+]), async (req, res) => {
+    try {
+        const { title, author, category, description } = req.body;
+
+        // Safety check: if req.files exists, use the path; otherwise, set to null
+        // This prevents the "Cannot read properties of undefined" error
+        const coverImage = (req.files && req.files['cover']) ? req.files['cover'][0].path : null;
+        const pdfUrl = (req.files && req.files['pdf']) ? req.files['pdf'][0].path : null;
+
+        const newBook = new Book({
+            title,
+            author,
+            category,
+            description,
+            coverImage,
+            pdfUrl,
+            isAvailable: true
+        });
+
+        await newBook.save();
+        res.status(201).json({ message: "Book Uploaded!", book: newBook });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 2. SEARCH BOOKS (Public/Student)
 router.get('/search', async (req, res) => {
-  try {
-    const { query } = req.query;
-    const filter = query 
-      ? { $or: [{ title: { $regex: query, $options: 'i' } }, { author: { $regex: query, $options: 'i' } }] }
-      : {};
-    const books = await Book.find(filter).limit(20);
-    res.json(books);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    try {
+        const { query, category } = req.query;
+        let filter = {};
+        
+        if (query) filter.title = { $regex: query, $options: 'i' };
+        if (category) filter.category = category;
+
+        const books = await Book.find(filter);
+        res.json(books);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// 2. ADD BOOK (Librarian Only)
-router.post('/add', protect, librarianOnly, async (req, res) => {
-  try {
-    const { title, author, category } = req.body;
-    const newBook = new Book({ title, author, category });
-    const savedBook = await newBook.save();
-    const notification = new Notification({ message: `New Wisdom Added: "${title}" by ${author}` });
-    await notification.save();
-    res.status(201).json({ message: "Book uploaded!", book: savedBook });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 3. BORROW BOOK (Authenticated Users)
+// 3. BORROW REQUEST (Student)
 router.post('/borrow', protect, async (req, res) => {
-  try {
-    const { bookId, returnInDays } = req.body; 
-    const book = await Book.findById(bookId);
-    if (!book) return res.status(404).json({ message: "Book not found" });
-    if (!book.isAvailable) return res.status(400).json({ message: "Book is currently borrowed" });
+    try {
+        const { bookId } = req.body;
+        const book = await Book.findById(bookId);
 
-    const days = returnInDays || 14;
-    const dueDate = new Date();
-    dueDate.setDate(dueDate.getDate() + days);
+        if (!book) return res.status(404).json({ message: "Book not found" });
+        
+        // Validation to ensure book is not already out
+        if (!book.isAvailable) {
+            return res.status(400).json({ message: "Book is currently borrowed by someone else" });
+        }
 
-    const newBorrow = new Borrow({ user: req.user.id, book: bookId, dueDate: dueDate });
-    await newBorrow.save();
-    book.isAvailable = false;
-    await book.save();
+        const newBorrow = new Borrow({
+            user: req.user.id,
+            book: bookId,
+            status: 'pending' // Admin/Librarian will approve this later
+        });
 
-    res.status(201).json({ message: "Borrowed successfully!", dueDate: dueDate.toDateString() });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 4. RETURN BOOK (Librarian Only) <--- THIS WAS MISSING
-router.post('/return', protect, librarianOnly, async (req, res) => {
-  try {
-    const { borrowId } = req.body;
-    const borrowRecord = await Borrow.findById(borrowId);
-    if (!borrowRecord) return res.status(404).json({ message: "Record not found" });
-    if (borrowRecord.status === 'returned') return res.status(400).json({ message: "Already returned" });
-
-    borrowRecord.status = 'returned';
-    await borrowRecord.save();
-
-    const book = await Book.findById(borrowRecord.book);
-    if (book) { book.isAvailable = true; await book.save(); }
-
-    res.json({ message: "Book returned successfully!" });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 5. PERSONAL STATUS (My Borrows)
-router.get('/my-status', protect, async (req, res) => {
-  try {
-    const activeBorrows = await Borrow.find({ user: req.user.id, status: 'borrowed' }).populate('book');
-    const statusReport = activeBorrows.map(item => {
-      const today = new Date();
-      const diffDays = Math.ceil((item.dueDate - today) / (1000 * 60 * 60 * 24));
-      let alert = "Active";
-      if (diffDays <= 2 && diffDays > 0) alert = `⚠️ Only ${diffDays} days left!`;
-      else if (diffDays <= 0) alert = `🚨 OVERDUE!`;
-      return { bookTitle: item.book.title, dueDate: item.dueDate, alert };
-    });
-    res.json(statusReport);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 6. GLOBAL NOTIFICATIONS
-router.get('/notifications', async (req, res) => {
-  try {
-    const alerts = await Notification.find().sort({ createdAt: -1 }).limit(10);
-    res.json(alerts);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+        await newBorrow.save();
+        res.status(201).json({ message: "Borrow request sent to Admin", borrow: newBorrow });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 module.exports = router;
